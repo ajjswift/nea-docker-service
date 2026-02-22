@@ -30,8 +30,8 @@ Stream events mirror the websocket app contract:
 ## Run
 
 ```bash
-bun install
-bun run index.js
+npm install
+npm start
 ```
 
 Copy `/Users/alexx/projects/school/NEA/proper-thing/docker-runner-service/.env.example` to `.env` before running.
