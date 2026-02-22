@@ -14,6 +14,9 @@ const RUNNER_CPUS = process.env.RUNNER_CPUS || "0.5";
 const RUNNER_TIMEOUT_MS = Number(process.env.RUNNER_TIMEOUT_MS || 120000);
 const RUNNER_NETWORK = process.env.RUNNER_NETWORK || "none";
 const MAX_BUFFERED_EVENTS = Number(process.env.MAX_BUFFERED_EVENTS || 250);
+const RUNNER_SESSION_RETENTION_MS = Number(
+    process.env.RUNNER_SESSION_RETENTION_MS || 30000
+);
 
 function sendJson(res, status, payload) {
     const data = JSON.stringify(payload);
@@ -114,6 +117,7 @@ class ExecutionSession {
         this.timeoutId = null;
         this.cleaned = false;
         this.stopping = false;
+        this.ended = false;
 
         this.subscribers = new Set();
         this.bufferedEvents = [];
@@ -207,6 +211,15 @@ class ExecutionSession {
             }
             this.bufferedEvents = [];
         }
+
+        if (this.ended && ws.readyState === WebSocket.OPEN) {
+            // Keep event ordering: close frame is sent after buffered events.
+            setTimeout(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.close(1000, "Session completed");
+                }
+            }, 0);
+        }
     }
 
     detachSubscriber(ws) {
@@ -244,6 +257,7 @@ class ExecutionSession {
     async cleanup() {
         if (this.cleaned) return;
         this.cleaned = true;
+        this.ended = true;
 
         if (this.timeoutId) {
             clearTimeout(this.timeoutId);
@@ -269,6 +283,7 @@ class ExecutionSession {
 class SessionStore {
     constructor() {
         this.sessions = new Map();
+        this.cleanupTimers = new Map();
     }
 
     get(id) {
@@ -277,7 +292,7 @@ class SessionStore {
 
     async create(files, entryFile) {
         const session = new ExecutionSession(files, entryFile, (id) => {
-            this.sessions.delete(id);
+            this.markForCleanup(id);
         });
 
         this.sessions.set(session.id, session);
@@ -285,10 +300,35 @@ class SessionStore {
             await session.start();
             return session;
         } catch (error) {
-            this.sessions.delete(session.id);
+            this.deleteNow(session.id);
             await session.cleanup();
             throw error;
         }
+    }
+
+    markForCleanup(id) {
+        if (!this.sessions.has(id)) return;
+        if (this.cleanupTimers.has(id)) return;
+
+        if (!Number.isFinite(RUNNER_SESSION_RETENTION_MS) || RUNNER_SESSION_RETENTION_MS <= 0) {
+            this.deleteNow(id);
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            this.deleteNow(id);
+        }, RUNNER_SESSION_RETENTION_MS);
+
+        this.cleanupTimers.set(id, timer);
+    }
+
+    deleteNow(id) {
+        const existingTimer = this.cleanupTimers.get(id);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.cleanupTimers.delete(id);
+        }
+        this.sessions.delete(id);
     }
 }
 

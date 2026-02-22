@@ -26,6 +26,7 @@ Stream events mirror the websocket app contract:
 - `RUNNER_TIMEOUT_MS` default `120000`
 - `RUNNER_NETWORK` default `none`
 - `MAX_BUFFERED_EVENTS` default `250`
+- `RUNNER_SESSION_RETENTION_MS` default `30000` (keeps completed sessions briefly so late stream connections can still receive exit/output events)
 
 ## Run
 
