@@ -9,11 +9,17 @@ import { WebSocketServer, WebSocket } from "ws";
 const PORT = Number(process.env.PORT || 3030);
 const RUNNER_API_KEY = `${process.env.RUNNER_API_KEY || ""}`.trim();
 const RUNNER_IMAGE = process.env.RUNNER_IMAGE || "python:3.11-alpine";
+const RUNNER_RUFF_IMAGE =
+    process.env.RUNNER_RUFF_IMAGE || "ghcr.io/astral-sh/ruff:latest";
 const RUNNER_MEMORY = process.env.RUNNER_MEMORY || "256m";
 const RUNNER_CPUS = process.env.RUNNER_CPUS || "0.5";
 const RUNNER_TIMEOUT_MS = Number(process.env.RUNNER_TIMEOUT_MS || 120000);
+const RUNNER_TOOL_TIMEOUT_MS = Number(process.env.RUNNER_TOOL_TIMEOUT_MS || 20000);
 const RUNNER_NETWORK = process.env.RUNNER_NETWORK || "none";
 const MAX_BUFFERED_EVENTS = Number(process.env.MAX_BUFFERED_EVENTS || 250);
+const MAX_TOOL_INPUT_BYTES = Number(
+    process.env.MAX_TOOL_INPUT_BYTES || 250000
+);
 const RUNNER_SESSION_RETENTION_MS = Number(
     process.env.RUNNER_SESSION_RETENTION_MS || 30000
 );
@@ -101,6 +107,312 @@ function resolveEntryFile(files, providedEntryFile) {
         return "main.py";
     }
     return files[0]?.name || "main.py";
+}
+
+function normalizePythonToolPayload(body = {}) {
+    const fileName = basename(
+        typeof body?.fileName === "string" ? body.fileName.trim() : ""
+    );
+    const source =
+        typeof body?.source === "string" ? body.source : `${body?.source ?? ""}`;
+
+    if (!fileName) {
+        throw new Error("fileName is required.");
+    }
+    if (!fileName.toLowerCase().endsWith(".py")) {
+        throw new Error("Only Python files (.py) are supported.");
+    }
+
+    const sourceBytes = Buffer.byteLength(source, "utf8");
+    if (
+        Number.isFinite(MAX_TOOL_INPUT_BYTES) &&
+        MAX_TOOL_INPUT_BYTES > 0 &&
+        sourceBytes > MAX_TOOL_INPUT_BYTES
+    ) {
+        throw new Error("Source is too large.");
+    }
+
+    return { fileName, source };
+}
+
+function runDockerCommand({
+    image,
+    args,
+    input = "",
+    timeoutMs = RUNNER_TOOL_TIMEOUT_MS,
+}) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(
+            "docker",
+            [
+                "run",
+                "--rm",
+                "-i",
+                "--network",
+                RUNNER_NETWORK,
+                "--memory",
+                RUNNER_MEMORY,
+                "--cpus",
+                RUNNER_CPUS,
+                image,
+                ...args,
+            ],
+            {
+                stdio: ["pipe", "pipe", "pipe"],
+            }
+        );
+
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+
+        const finish = (value, isError = false) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeoutId);
+            if (isError) {
+                reject(value);
+                return;
+            }
+            resolve(value);
+        };
+
+        const timeoutId = setTimeout(() => {
+            try {
+                child.kill("SIGKILL");
+            } catch {
+                // Ignore kill errors.
+            }
+            finish(
+                {
+                    exitCode: null,
+                    stdout,
+                    stderr: "Tool execution timed out.",
+                    timedOut: true,
+                },
+                false
+            );
+        }, timeoutMs);
+
+        child.stdout.on("data", (chunk) => {
+            stdout += `${chunk}`;
+        });
+        child.stderr.on("data", (chunk) => {
+            stderr += `${chunk}`;
+        });
+        child.on("error", (error) => {
+            finish(error, true);
+        });
+        child.on("close", (exitCode) => {
+            finish({
+                exitCode,
+                stdout,
+                stderr,
+                timedOut: false,
+            });
+        });
+
+        child.stdin.write(input);
+        child.stdin.end();
+    });
+}
+
+function normalizeNewlines(source) {
+    return `${source || ""}`.replace(/\r\n/g, "\n");
+}
+
+function countLeadingSpaces(line) {
+    const leading = line.match(/^(\s*)/)?.[1] || "";
+    return leading.replace(/\t/g, "    ").length;
+}
+
+function isRecoverableIndentationError(errorText) {
+    return /(unexpected indentation|unexpected indent|unindent does not match any outer indentation level)/i.test(
+        `${errorText || ""}`
+    );
+}
+
+function repairCommonIndentation(source) {
+    const lines = normalizeNewlines(source).split("\n");
+    const repaired = [...lines];
+
+    let previousCodeLine = null;
+    let previousIndent = 0;
+
+    for (let index = 0; index < repaired.length; index += 1) {
+        const rawLine = repaired[index] || "";
+        const normalizedLine = rawLine.replace(/\t/g, "    ");
+        const trimmed = normalizedLine.trim();
+
+        if (!trimmed) {
+            repaired[index] = "";
+            continue;
+        }
+
+        const currentIndent = countLeadingSpaces(normalizedLine);
+        const previousEndsBlock = previousCodeLine?.trimEnd().endsWith(":");
+        let nextIndent = currentIndent;
+
+        if (!previousCodeLine && currentIndent > 0) {
+            nextIndent = 0;
+        } else if (!previousEndsBlock && currentIndent > previousIndent) {
+            nextIndent = previousIndent;
+        } else if (previousEndsBlock && currentIndent <= previousIndent) {
+            nextIndent = previousIndent + 4;
+        }
+
+        if (nextIndent % 4 !== 0) {
+            nextIndent = Math.max(0, Math.floor(nextIndent / 4) * 4);
+        }
+
+        repaired[index] = `${" ".repeat(nextIndent)}${trimmed}`;
+        previousCodeLine = repaired[index];
+        previousIndent = nextIndent;
+    }
+
+    return repaired.join("\n");
+}
+
+async function handlePythonFormatRequest(req, res) {
+    if (!isAuthorized(req)) {
+        sendJson(res, 401, { error: "Unauthorized." });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+        return;
+    }
+
+    let payload;
+    try {
+        payload = normalizePythonToolPayload(body);
+    } catch (error) {
+        sendJson(res, 400, { error: error.message || "Invalid payload." });
+        return;
+    }
+
+    try {
+        const result = await runDockerCommand({
+            image: RUNNER_RUFF_IMAGE,
+            args: ["format", "--stdin-filename", payload.fileName, "-"],
+            input: payload.source,
+        });
+
+        if (result.timedOut) {
+            sendJson(res, 504, { error: result.stderr || "Format request timed out." });
+            return;
+        }
+
+        if (result.exitCode !== 0) {
+            const formatError = result.stderr.trim() || "Could not format Python source.";
+
+            if (isRecoverableIndentationError(formatError)) {
+                const repairedSource = repairCommonIndentation(payload.source);
+                const recovered = await runDockerCommand({
+                    image: RUNNER_RUFF_IMAGE,
+                    args: ["format", "--stdin-filename", payload.fileName, "-"],
+                    input: repairedSource,
+                });
+
+                if (!recovered.timedOut && recovered.exitCode === 0) {
+                    sendJson(res, 200, {
+                        formattedContent: recovered.stdout,
+                        repairedIndentation: true,
+                    });
+                    return;
+                }
+            }
+
+            sendJson(res, 400, {
+                error: formatError,
+            });
+            return;
+        }
+
+        sendJson(res, 200, {
+            formattedContent: result.stdout,
+        });
+    } catch (error) {
+        console.error("Python format request failed:", error);
+        sendJson(res, 500, {
+            error: "Failed to run Python formatter.",
+        });
+    }
+}
+
+async function handlePythonLintRequest(req, res) {
+    if (!isAuthorized(req)) {
+        sendJson(res, 401, { error: "Unauthorized." });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+        return;
+    }
+
+    let payload;
+    try {
+        payload = normalizePythonToolPayload(body);
+    } catch (error) {
+        sendJson(res, 400, { error: error.message || "Invalid payload." });
+        return;
+    }
+
+    try {
+        const result = await runDockerCommand({
+            image: RUNNER_RUFF_IMAGE,
+            args: [
+                "check",
+                "--stdin-filename",
+                payload.fileName,
+                "--output-format",
+                "json",
+                "-",
+            ],
+            input: payload.source,
+        });
+
+        if (result.timedOut) {
+            sendJson(res, 504, { error: result.stderr || "Lint request timed out." });
+            return;
+        }
+
+        if (result.exitCode !== 0 && result.exitCode !== 1) {
+            sendJson(res, 400, {
+                error: result.stderr.trim() || "Could not lint Python source.",
+            });
+            return;
+        }
+
+        let diagnostics = [];
+        try {
+            const parsed = JSON.parse(result.stdout || "[]");
+            diagnostics = Array.isArray(parsed) ? parsed : [];
+        } catch {
+            sendJson(res, 500, {
+                error: "Lint output could not be parsed.",
+            });
+            return;
+        }
+
+        sendJson(res, 200, {
+            diagnostics,
+            hasIssues: diagnostics.length > 0,
+        });
+    } catch (error) {
+        console.error("Python lint request failed:", error);
+        sendJson(res, 500, {
+            error: "Failed to run Python linter.",
+        });
+    }
 }
 
 class ExecutionSession {
@@ -378,6 +690,16 @@ const httpServer = createServer(async (req, res) => {
                     error: error?.message || "Failed to create execution session.",
                 });
             }
+            return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/v1/python/format") {
+            await handlePythonFormatRequest(req, res);
+            return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/v1/python/lint") {
+            await handlePythonLintRequest(req, res);
             return;
         }
 
