@@ -11,10 +11,12 @@ const RUNNER_API_KEY = `${process.env.RUNNER_API_KEY || ""}`.trim();
 const RUNNER_IMAGE = process.env.RUNNER_IMAGE || "python:3.11-alpine";
 const RUNNER_RUFF_IMAGE =
     process.env.RUNNER_RUFF_IMAGE || "ghcr.io/astral-sh/ruff:latest";
-const RUNNER_MEMORY = process.env.RUNNER_MEMORY || "256m";
-const RUNNER_CPUS = process.env.RUNNER_CPUS || "0.5";
-const RUNNER_TIMEOUT_MS = Number(process.env.RUNNER_TIMEOUT_MS || 120000);
-const RUNNER_TOOL_TIMEOUT_MS = Number(process.env.RUNNER_TOOL_TIMEOUT_MS || 20000);
+const RUNNER_MEMORY = process.env.RUNNER_MEMORY || "1024m";
+const RUNNER_CPUS = process.env.RUNNER_CPUS || "1";
+const RUNNER_TIMEOUT_MS = Number(process.env.RUNNER_TIMEOUT_MS || 1200000);
+const RUNNER_TOOL_TIMEOUT_MS = Number(
+    process.env.RUNNER_TOOL_TIMEOUT_MS || 200000,
+);
 const RUNNER_NETWORK = process.env.RUNNER_NETWORK || "none";
 const MAX_BUFFERED_EVENTS = Number(process.env.MAX_BUFFERED_EVENTS || 250);
 const MAX_TOOL_INPUT_BYTES = Number(
@@ -76,6 +78,7 @@ function normalizeFiles(files) {
     }
 
     const normalized = [];
+
     for (const file of files) {
         const safeName = basename(
             typeof file?.name === "string" ? file.name.trim() : ""
