@@ -18,6 +18,7 @@ trap cleanup EXIT
 if [ "${ENABLE_DISPLAY:-0}" = "1" ]; then
     export DISPLAY=":${DISPLAY_NUMBER:-99}"
     export SDL_VIDEODRIVER="x11"
+    export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
 
     Xvfb "${DISPLAY}" -screen 0 "${DISPLAY_SCREEN:-1280x720x24}" -ac >/tmp/xvfb.log 2>&1 &
     XVFB_PID=$!

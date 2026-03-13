@@ -34,6 +34,10 @@ const RUNNER_DISPLAY_VNC_PORT = Number(
 const RUNNER_DISPLAY_NOVNC_PORT = Number(
     process.env.RUNNER_DISPLAY_NOVNC_PORT || 6080
 );
+const RUNNER_DISPLAY_BIND_HOST =
+    process.env.RUNNER_DISPLAY_BIND_HOST || "127.0.0.1";
+const RUNNER_DISPLAY_PROXY_HOST =
+    process.env.RUNNER_DISPLAY_PROXY_HOST || "127.0.0.1";
 const RUNNER_DISPLAY_SCREEN =
     process.env.RUNNER_DISPLAY_SCREEN || "1280x720x24";
 const RUNNER_DISPLAY_START_TIMEOUT_MS = Number(
@@ -328,7 +332,7 @@ async function resolvePublishedPort(containerName, containerPort) {
 
 async function waitForDisplayReady(hostPort) {
     const startedAt = Date.now();
-    const url = `http://127.0.0.1:${hostPort}/vnc.html`;
+    const url = `http://${RUNNER_DISPLAY_PROXY_HOST}:${hostPort}/vnc.html`;
 
     while (Date.now() - startedAt < RUNNER_DISPLAY_START_TIMEOUT_MS) {
         try {
@@ -645,7 +649,7 @@ class ExecutionSession {
         if (this.enableDisplay) {
             dockerArgs.push(
                 "-p",
-                `127.0.0.1::${RUNNER_DISPLAY_NOVNC_PORT}`
+                `${RUNNER_DISPLAY_BIND_HOST}::${RUNNER_DISPLAY_NOVNC_PORT}`
             );
         }
 
@@ -1011,7 +1015,7 @@ const httpServer = createServer(async (req, res) => {
                     ["displayToken"]
                 )}`;
                 const upstream = await fetch(
-                    `http://127.0.0.1:${session.displayHostPort}${upstreamPath}`
+                    `http://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}${upstreamPath}`
                 );
                 await proxyHttpResponse(res, upstream);
             } catch (error) {
@@ -1182,7 +1186,7 @@ displayWsServer.on("connection", (downstream, sessionId) => {
     }
 
     const upstream = new WebSocket(
-        `ws://127.0.0.1:${session.displayHostPort}/websockify`
+        `ws://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}/websockify`
     );
     upstream.binaryType = "arraybuffer";
 
