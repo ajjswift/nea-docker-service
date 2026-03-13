@@ -436,15 +436,18 @@ async function proxyHttpResponse(res, upstreamResponse) {
         const normalized = key.toLowerCase();
         if (
             normalized === "connection" ||
+            normalized === "content-length" ||
+            normalized === "date" ||
+            normalized === "server" ||
             normalized === "transfer-encoding" ||
             normalized === "keep-alive"
         ) {
             continue;
         }
-        headers[key] = value;
+        headers[normalized] = value;
     }
 
-    headers["Content-Length"] = body.length;
+    headers["content-length"] = String(body.length);
     res.writeHead(upstreamResponse.status, headers);
     res.end(body);
 }
