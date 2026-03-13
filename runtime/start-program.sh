@@ -89,6 +89,10 @@ if [ "${ENABLE_DISPLAY:-0}" = "1" ]; then
         -localhost \
         -forever \
         -shared \
+        -noxdamage \
+        -wait 5 \
+        -defer 5 \
+        -repeat \
         -nopw >/tmp/x11vnc.log 2>&1 &
     X11VNC_PID=$!
 
