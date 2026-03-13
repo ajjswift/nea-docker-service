@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { createServer } from "http";
-import { readFile, writeFile, mkdtemp, rm } from "fs/promises";
+import { readFile, writeFile, mkdtemp, rm, readdir } from "fs/promises";
 import { spawn } from "child_process";
 import { tmpdir } from "os";
 import { basename, join } from "path";
@@ -50,6 +50,7 @@ const RUNNER_LAUNCH_SCRIPT_PATH = new URL(
     "./runtime/start-program.sh",
     import.meta.url
 );
+const RUNNER_LAUNCH_SCRIPT_NAME = "__runner_start__.sh";
 
 function maskToken(value) {
     const token = `${value || ""}`.trim();
@@ -173,6 +174,30 @@ function normalizeFiles(files) {
     }
 
     return normalized;
+}
+
+async function readWorkspaceFiles(workspaceDir) {
+    if (!workspaceDir) {
+        return [];
+    }
+
+    const entries = await readdir(workspaceDir, { withFileTypes: true });
+    const files = [];
+
+    for (const entry of entries) {
+        if (!entry.isFile() || entry.name === RUNNER_LAUNCH_SCRIPT_NAME) {
+            continue;
+        }
+
+        const filePath = join(workspaceDir, entry.name);
+        const content = await readFile(filePath, "utf-8");
+        files.push({
+            name: basename(entry.name),
+            content,
+        });
+    }
+
+    return files;
 }
 
 function normalizeBoolean(value) {
@@ -670,6 +695,7 @@ class ExecutionSession {
         this.ended = false;
         this.displayHostPort = null;
         this.displayScriptPath = null;
+        this.finalFiles = this.files.map((file) => ({ ...file }));
 
         this.subscribers = new Set();
         this.bufferedEvents = [];
@@ -681,7 +707,7 @@ class ExecutionSession {
             await writeFile(join(this.tempDir, file.name), file.content, "utf-8");
         }
 
-        this.displayScriptPath = join(this.tempDir, "__runner_start__.sh");
+        this.displayScriptPath = join(this.tempDir, RUNNER_LAUNCH_SCRIPT_NAME);
         const launchScript = await readFile(RUNNER_LAUNCH_SCRIPT_PATH, "utf-8");
         await writeFile(this.displayScriptPath, launchScript, "utf-8");
 
@@ -725,7 +751,7 @@ class ExecutionSession {
         dockerArgs.push(
             RUNNER_IMAGE,
             "/bin/sh",
-            "/workspace/__runner_start__.sh"
+            `/workspace/${RUNNER_LAUNCH_SCRIPT_NAME}`
         );
 
         logDisplayDebug("session-start", {
@@ -774,6 +800,7 @@ class ExecutionSession {
                 ...summarizeSession(this),
                 exitCode,
             });
+            await this.captureWorkspaceFiles();
             if (this.enableDisplay) {
                 this.emit({
                     type: "displayState",
@@ -833,6 +860,28 @@ class ExecutionSession {
                 throw error;
             }
         }
+    }
+
+    async captureWorkspaceFiles() {
+        if (!this.tempDir) {
+            return this.finalFiles.map((file) => ({ ...file }));
+        }
+
+        try {
+            this.finalFiles = await readWorkspaceFiles(this.tempDir);
+        } catch (error) {
+            console.error("Failed to capture workspace files:", error);
+        }
+
+        return this.finalFiles.map((file) => ({ ...file }));
+    }
+
+    async getWorkspaceFiles() {
+        if (this.tempDir) {
+            return this.captureWorkspaceFiles();
+        }
+
+        return this.finalFiles.map((file) => ({ ...file }));
     }
 
     async waitForDisplayPort() {
@@ -979,6 +1028,7 @@ class ExecutionSession {
 
         if (this.tempDir) {
             try {
+                await this.captureWorkspaceFiles();
                 await rm(this.tempDir, { recursive: true, force: true });
             } catch (error) {
                 console.error("Cleanup error:", error);
@@ -1283,6 +1333,18 @@ const httpServer = createServer(async (req, res) => {
             } catch (error) {
                 sendJson(res, 500, {
                     error: error?.message || "Failed to stop session.",
+                });
+            }
+            return;
+        }
+
+        if (route.action === "files" && req.method === "GET") {
+            try {
+                const files = await session.getWorkspaceFiles();
+                sendJson(res, 200, { files });
+            } catch (error) {
+                sendJson(res, 500, {
+                    error: error?.message || "Failed to read session files.",
                 });
             }
             return;

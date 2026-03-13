@@ -7,6 +7,7 @@ Privileged execution API for running student code inside Docker, intended to be 
 - `GET /health`
 - `POST /v1/sessions` creates a session and starts execution
 - `GET /v1/sessions/:id/stream?streamToken=...` streams run events via WebSocket
+- `GET /v1/sessions/:id/files` returns the latest workspace snapshot for a session
 - `POST /v1/sessions/:id/stdin` sends stdin
 - `POST /v1/sessions/:id/stop` stops execution
 - `POST /v1/python/format` formats Python via Ruff (`{ fileName, source }`)
