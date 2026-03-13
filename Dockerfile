@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-symbola \
     libgl1 \
     libglib2.0-0 \
+    libgomp1 \
     libsdl2-2.0-0 \
     libsdl2-image-2.0-0 \
     libsdl2-mixer-2.0-0 \
@@ -32,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir pygame
+COPY requirements.txt /tmp/requirements.txt
+
+RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
 WORKDIR /workspace

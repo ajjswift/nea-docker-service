@@ -1,0 +1,16 @@
+bcrypt
+beautifulsoup4
+matplotlib
+networkx
+numpy
+pandas
+pillow
+pygame
+pyyaml
+requests
+scikit-learn
+scipy
+seaborn
+sympy
+torch
+tqdm

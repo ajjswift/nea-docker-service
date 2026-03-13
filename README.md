@@ -23,7 +23,7 @@ Stream events mirror the websocket app contract:
 
 - `PORT` default `3030`
 - `RUNNER_API_KEY` optional shared secret; if set, HTTP calls require `Authorization: Bearer <key>`
-- `RUNNER_IMAGE` default `python:3.11-alpine`
+- `RUNNER_IMAGE` default `proper-thing/python-runner:gui`
 - `RUNNER_RUFF_IMAGE` default `ghcr.io/astral-sh/ruff:latest`
 - `RUNNER_MEMORY` default `256m`
 - `RUNNER_CPUS` default `0.5`
@@ -34,11 +34,38 @@ Stream events mirror the websocket app contract:
 - `MAX_TOOL_INPUT_BYTES` default `250000`
 - `RUNNER_SESSION_RETENTION_MS` default `30000` (keeps completed sessions briefly so late stream connections can still receive exit/output events)
 
+## Bundled Python Packages
+
+The runner image is set up as a batteries-included Python environment for student code. It includes:
+
+- `bcrypt`
+- `beautifulsoup4`
+- `matplotlib`
+- `networkx`
+- `numpy`
+- `pandas`
+- `pillow`
+- `pygame`
+- `pyyaml`
+- `requests`
+- `scikit-learn`
+- `scipy`
+- `seaborn`
+- `sympy`
+- `torch`
+- `tqdm`
+
 ## Run
 
 ```bash
 npm install
 npm start
+```
+
+To rebuild the runner image after changing the Python package set:
+
+```bash
+docker build -t proper-thing/python-runner:gui .
 ```
 
 Copy `/Users/alexx/projects/school/NEA/proper-thing/docker-runner-service/.env.example` to `.env` before running.
