@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { createServer } from "http";
-import { writeFile, mkdtemp, rm } from "fs/promises";
+import { readFile, writeFile, mkdtemp, rm } from "fs/promises";
 import { spawn } from "child_process";
 import { tmpdir } from "os";
 import { basename, join } from "path";
@@ -8,7 +8,8 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = Number(process.env.PORT || 3030);
 const RUNNER_API_KEY = `${process.env.RUNNER_API_KEY || ""}`.trim();
-const RUNNER_IMAGE = process.env.RUNNER_IMAGE || "python:3.11-alpine";
+const RUNNER_IMAGE =
+    process.env.RUNNER_IMAGE || "proper-thing/python-runner:gui";
 const RUNNER_RUFF_IMAGE =
     process.env.RUNNER_RUFF_IMAGE || "ghcr.io/astral-sh/ruff:latest";
 const RUNNER_MEMORY = process.env.RUNNER_MEMORY || "1024m";
@@ -18,6 +19,7 @@ const RUNNER_TOOL_TIMEOUT_MS = Number(
     process.env.RUNNER_TOOL_TIMEOUT_MS || 200000,
 );
 const RUNNER_NETWORK = process.env.RUNNER_NETWORK || "none";
+const RUNNER_DISPLAY_NETWORK = process.env.RUNNER_DISPLAY_NETWORK || "bridge";
 const MAX_BUFFERED_EVENTS = Number(process.env.MAX_BUFFERED_EVENTS || 250);
 const MAX_TOOL_INPUT_BYTES = Number(
     process.env.MAX_TOOL_INPUT_BYTES || 250000
@@ -25,6 +27,26 @@ const MAX_TOOL_INPUT_BYTES = Number(
 const RUNNER_SESSION_RETENTION_MS = Number(
     process.env.RUNNER_SESSION_RETENTION_MS || 30000
 );
+const RUNNER_DISPLAY_NUMBER = `${process.env.RUNNER_DISPLAY_NUMBER || "99"}`;
+const RUNNER_DISPLAY_VNC_PORT = Number(
+    process.env.RUNNER_DISPLAY_VNC_PORT || 5900
+);
+const RUNNER_DISPLAY_NOVNC_PORT = Number(
+    process.env.RUNNER_DISPLAY_NOVNC_PORT || 6080
+);
+const RUNNER_DISPLAY_SCREEN =
+    process.env.RUNNER_DISPLAY_SCREEN || "1280x720x24";
+const RUNNER_DISPLAY_START_TIMEOUT_MS = Number(
+    process.env.RUNNER_DISPLAY_START_TIMEOUT_MS || 15000
+);
+const RUNNER_LAUNCH_SCRIPT_PATH = new URL(
+    "./runtime/start-program.sh",
+    import.meta.url
+);
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function sendJson(res, status, payload) {
     const data = JSON.stringify(payload);
@@ -99,6 +121,20 @@ function normalizeFiles(files) {
     }
 
     return normalized;
+}
+
+function normalizeBoolean(value) {
+    if (typeof value === "boolean") {
+        return value;
+    }
+    if (typeof value === "number") {
+        return value !== 0;
+    }
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        return normalized === "1" || normalized === "true" || normalized === "yes";
+    }
+    return false;
 }
 
 function resolveEntryFile(files, providedEntryFile) {
@@ -218,6 +254,129 @@ function runDockerCommand({
         child.stdin.write(input);
         child.stdin.end();
     });
+}
+
+function runCommand(command, args, { timeoutMs = 10000 } = {}) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, {
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+
+        const finish = (value, isError = false) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeoutId);
+            if (isError) {
+                reject(value);
+                return;
+            }
+            resolve(value);
+        };
+
+        const timeoutId = setTimeout(() => {
+            try {
+                child.kill("SIGKILL");
+            } catch {
+                // Ignore kill errors.
+            }
+            finish(
+                new Error(
+                    `${command} ${args.join(" ")} timed out after ${timeoutMs}ms`
+                ),
+                true
+            );
+        }, timeoutMs);
+
+        child.stdout.on("data", (chunk) => {
+            stdout += `${chunk}`;
+        });
+        child.stderr.on("data", (chunk) => {
+            stderr += `${chunk}`;
+        });
+        child.on("error", (error) => {
+            finish(error, true);
+        });
+        child.on("close", (exitCode) => {
+            finish({ exitCode, stdout, stderr });
+        });
+    });
+}
+
+async function resolvePublishedPort(containerName, containerPort) {
+    const result = await runCommand("docker", [
+        "port",
+        containerName,
+        `${containerPort}/tcp`,
+    ]);
+
+    if (result.exitCode !== 0) {
+        throw new Error(result.stderr.trim() || "Could not resolve published port.");
+    }
+
+    const output = result.stdout.trim().split("\n").find(Boolean) || "";
+    const match = output.match(/:(\d+)\s*$/);
+    const port = Number(match?.[1]);
+    if (!Number.isFinite(port)) {
+        throw new Error("Published port could not be parsed.");
+    }
+    return port;
+}
+
+async function waitForDisplayReady(hostPort) {
+    const startedAt = Date.now();
+    const url = `http://127.0.0.1:${hostPort}/vnc.html`;
+
+    while (Date.now() - startedAt < RUNNER_DISPLAY_START_TIMEOUT_MS) {
+        try {
+            const response = await fetch(url);
+            if (response.ok) {
+                return;
+            }
+        } catch {
+            // Retry until timeout.
+        }
+
+        await sleep(200);
+    }
+
+    throw new Error("Timed out waiting for the noVNC display to become ready.");
+}
+
+function sanitizeProxySearchParams(searchParams, excludedKeys = []) {
+    const params = new URLSearchParams();
+    for (const [key, value] of searchParams.entries()) {
+        if (excludedKeys.includes(key)) {
+            continue;
+        }
+        params.append(key, value);
+    }
+    const serialized = params.toString();
+    return serialized ? `?${serialized}` : "";
+}
+
+async function proxyHttpResponse(res, upstreamResponse) {
+    const body = Buffer.from(await upstreamResponse.arrayBuffer());
+    const headers = {};
+
+    for (const [key, value] of upstreamResponse.headers.entries()) {
+        const normalized = key.toLowerCase();
+        if (
+            normalized === "connection" ||
+            normalized === "transfer-encoding" ||
+            normalized === "keep-alive"
+        ) {
+            continue;
+        }
+        headers[key] = value;
+    }
+
+    headers["Content-Length"] = body.length;
+    res.writeHead(upstreamResponse.status, headers);
+    res.end(body);
 }
 
 function normalizeNewlines(source) {
@@ -419,11 +578,14 @@ async function handlePythonLintRequest(req, res) {
 }
 
 class ExecutionSession {
-    constructor(files, entryFile, onDispose) {
+    constructor(files, entryFile, enableDisplay, onDispose) {
+        const normalizedEnableDisplay = normalizeBoolean(enableDisplay);
         this.id = crypto.randomUUID();
         this.streamToken = crypto.randomUUID();
+        this.displayToken = normalizedEnableDisplay ? crypto.randomUUID() : null;
         this.files = normalizeFiles(files);
         this.entryFile = resolveEntryFile(this.files, entryFile);
+        this.enableDisplay = normalizedEnableDisplay;
         this.onDispose = onDispose;
 
         this.tempDir = null;
@@ -433,6 +595,8 @@ class ExecutionSession {
         this.cleaned = false;
         this.stopping = false;
         this.ended = false;
+        this.displayHostPort = null;
+        this.displayScriptPath = null;
 
         this.subscribers = new Set();
         this.bufferedEvents = [];
@@ -444,6 +608,10 @@ class ExecutionSession {
             await writeFile(join(this.tempDir, file.name), file.content, "utf-8");
         }
 
+        this.displayScriptPath = join(this.tempDir, "__runner_start__.sh");
+        const launchScript = await readFile(RUNNER_LAUNCH_SCRIPT_PATH, "utf-8");
+        await writeFile(this.displayScriptPath, launchScript, "utf-8");
+
         const dockerArgs = [
             "run",
             "--rm",
@@ -451,7 +619,7 @@ class ExecutionSession {
             "--name",
             this.containerName,
             "--network",
-            RUNNER_NETWORK,
+            this.enableDisplay ? RUNNER_DISPLAY_NETWORK : RUNNER_NETWORK,
             "--memory",
             RUNNER_MEMORY,
             "--cpus",
@@ -460,11 +628,32 @@ class ExecutionSession {
             `${this.tempDir}:/workspace`,
             "-w",
             "/workspace",
-            RUNNER_IMAGE,
-            "python",
-            "-u",
-            this.entryFile,
+            "-e",
+            `ENTRY_FILE=${this.entryFile}`,
+            "-e",
+            `ENABLE_DISPLAY=${this.enableDisplay ? "1" : "0"}`,
+            "-e",
+            `DISPLAY_NUMBER=${RUNNER_DISPLAY_NUMBER}`,
+            "-e",
+            `DISPLAY_SCREEN=${RUNNER_DISPLAY_SCREEN}`,
+            "-e",
+            `VNC_PORT=${RUNNER_DISPLAY_VNC_PORT}`,
+            "-e",
+            `NOVNC_PORT=${RUNNER_DISPLAY_NOVNC_PORT}`,
         ];
+
+        if (this.enableDisplay) {
+            dockerArgs.push(
+                "-p",
+                `127.0.0.1::${RUNNER_DISPLAY_NOVNC_PORT}`
+            );
+        }
+
+        dockerArgs.push(
+            RUNNER_IMAGE,
+            "/bin/sh",
+            "/workspace/__runner_start__.sh"
+        );
 
         this.process = spawn("docker", dockerArgs, {
             stdio: ["pipe", "pipe", "pipe"],
@@ -494,9 +683,74 @@ class ExecutionSession {
         });
 
         this.process.on("close", async (exitCode) => {
+            if (this.enableDisplay) {
+                this.emit({
+                    type: "displayState",
+                    data: {
+                        enabled: false,
+                        status: "closed",
+                    },
+                });
+            }
             this.emit({ type: "programExit", data: { exitCode } });
             await this.cleanup();
         });
+
+        if (this.enableDisplay) {
+            this.emit({
+                type: "displayState",
+                data: {
+                    enabled: true,
+                    status: "starting",
+                },
+            });
+
+            try {
+                this.displayHostPort = await this.waitForDisplayPort();
+                await waitForDisplayReady(this.displayHostPort);
+                this.emit({
+                    type: "displayState",
+                    data: {
+                        enabled: true,
+                        status: "ready",
+                    },
+                });
+            } catch (error) {
+                this.emit({
+                    type: "displayState",
+                    data: {
+                        enabled: false,
+                        status: "error",
+                        reason:
+                            error?.message ||
+                            "The graphical display did not become ready.",
+                    },
+                });
+                await this.stop();
+                throw error;
+            }
+        }
+    }
+
+    async waitForDisplayPort() {
+        const startedAt = Date.now();
+
+        while (Date.now() - startedAt < RUNNER_DISPLAY_START_TIMEOUT_MS) {
+            if (!this.process || this.process.exitCode !== null) {
+                throw new Error("The graphical container exited before the display was ready.");
+            }
+
+            try {
+                return await resolvePublishedPort(
+                    this.containerName,
+                    RUNNER_DISPLAY_NOVNC_PORT
+                );
+            } catch {
+                await sleep(200);
+            }
+        }
+
+        throw new Error("Timed out waiting for the published noVNC port.");
     }
 
     emit(event) {
@@ -548,6 +802,18 @@ class ExecutionSession {
         this.process.stdin.write(`${input ?? ""}`);
     }
 
+    hasDisplay() {
+        return this.enableDisplay && Number.isFinite(this.displayHostPort);
+    }
+
+    validateDisplayToken(token) {
+        return Boolean(
+            this.displayToken &&
+                `${token || ""}`.trim() &&
+                `${token}` === this.displayToken
+        );
+    }
+
     async stop() {
         if (this.stopping) return;
         this.stopping = true;
@@ -581,6 +847,8 @@ class ExecutionSession {
 
         this.process = null;
         this.containerName = null;
+        this.displayHostPort = null;
+        this.displayScriptPath = null;
 
         if (this.tempDir) {
             try {
@@ -605,8 +873,8 @@ class SessionStore {
         return this.sessions.get(id) || null;
     }
 
-    async create(files, entryFile) {
-        const session = new ExecutionSession(files, entryFile, (id) => {
+    async create(files, entryFile, enableDisplay) {
+        const session = new ExecutionSession(files, entryFile, enableDisplay, (id) => {
             this.markForCleanup(id);
         });
 
@@ -616,6 +884,7 @@ class SessionStore {
             return session;
         } catch (error) {
             this.deleteNow(session.id);
+            await session.stop().catch(() => {});
             await session.cleanup();
             throw error;
         }
@@ -658,6 +927,27 @@ function parseSessionRoute(pathname) {
     };
 }
 
+function parseDisplayAssetRoute(pathname) {
+    const match = pathname.match(
+        /^\/v1\/sessions\/([^/]+)\/display\/novnc\/(.+)$/
+    );
+    if (!match) return null;
+    return {
+        sessionId: decodeURIComponent(match[1]),
+        assetPath: match[2],
+    };
+}
+
+function parseDisplaySocketRoute(pathname) {
+    const match = pathname.match(
+        /^\/v1\/sessions\/([^/]+)\/display\/websockify$/
+    );
+    if (!match) return null;
+    return {
+        sessionId: decodeURIComponent(match[1]),
+    };
+}
+
 const httpServer = createServer(async (req, res) => {
     try {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -682,15 +972,53 @@ const httpServer = createServer(async (req, res) => {
             }
 
             try {
-                const session = await sessions.create(body?.files, body?.entryFile);
+                const session = await sessions.create(
+                    body?.files,
+                    body?.entryFile,
+                    body?.enableDisplay
+                );
                 sendJson(res, 200, {
                     sessionId: session.id,
                     streamToken: session.streamToken,
+                    displayToken: session.displayToken,
                 });
             } catch (error) {
                 console.error("Failed to create session:", error);
                 sendJson(res, 500, {
                     error: error?.message || "Failed to create execution session.",
+                });
+            }
+            return;
+        }
+
+        const displayAssetRoute = parseDisplayAssetRoute(url.pathname);
+        if (displayAssetRoute && req.method === "GET") {
+            const session = sessions.get(displayAssetRoute.sessionId);
+            if (!session || !session.hasDisplay()) {
+                sendJson(res, 404, { error: "Display session not found." });
+                return;
+            }
+
+            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
+            if (!session.validateDisplayToken(displayToken)) {
+                sendJson(res, 401, { error: "Unauthorized." });
+                return;
+            }
+
+            try {
+                const upstreamPath = `/${displayAssetRoute.assetPath}${sanitizeProxySearchParams(
+                    url.searchParams,
+                    ["displayToken"]
+                )}`;
+                const upstream = await fetch(
+                    `http://127.0.0.1:${session.displayHostPort}${upstreamPath}`
+                );
+                await proxyHttpResponse(res, upstream);
+            } catch (error) {
+                sendJson(res, 502, {
+                    error:
+                        error?.message ||
+                        "Could not proxy the noVNC asset request.",
                 });
             }
             return;
@@ -773,11 +1101,34 @@ const httpServer = createServer(async (req, res) => {
 });
 
 const wsServer = new WebSocketServer({ noServer: true });
+const displayWsServer = new WebSocketServer({ noServer: true });
 
 httpServer.on("upgrade", (req, socket, head) => {
     try {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
         const route = parseSessionRoute(url.pathname);
+        const displayRoute = parseDisplaySocketRoute(url.pathname);
+
+        if (displayRoute) {
+            const session = sessions.get(displayRoute.sessionId);
+            if (!session || !session.hasDisplay()) {
+                socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+                socket.destroy();
+                return;
+            }
+
+            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
+            if (!session.validateDisplayToken(displayToken)) {
+                socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+                socket.destroy();
+                return;
+            }
+
+            displayWsServer.handleUpgrade(req, socket, head, (ws) => {
+                displayWsServer.emit("connection", ws, displayRoute.sessionId);
+            });
+            return;
+        }
 
         if (!route || route.action !== "stream") {
             socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
@@ -820,6 +1171,65 @@ wsServer.on("connection", (ws, sessionId) => {
         const existing = sessions.get(sessionId);
         if (!existing) return;
         existing.detachSubscriber(ws);
+    });
+});
+
+displayWsServer.on("connection", (downstream, sessionId) => {
+    const session = sessions.get(sessionId);
+    if (!session || !session.hasDisplay()) {
+        downstream.close();
+        return;
+    }
+
+    const upstream = new WebSocket(
+        `ws://127.0.0.1:${session.displayHostPort}/websockify`
+    );
+    upstream.binaryType = "arraybuffer";
+
+    const closeBoth = () => {
+        if (downstream.readyState === WebSocket.OPEN) {
+            downstream.close();
+        }
+        if (
+            upstream.readyState === WebSocket.OPEN ||
+            upstream.readyState === WebSocket.CONNECTING
+        ) {
+            upstream.close();
+        }
+    };
+
+    downstream.on("message", (data, isBinary) => {
+        if (upstream.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        upstream.send(data, { binary: isBinary });
+    });
+
+    downstream.on("close", () => {
+        closeBoth();
+    });
+
+    downstream.on("error", () => {
+        closeBoth();
+    });
+
+    upstream.on("message", (data, isBinary) => {
+        if (downstream.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        downstream.send(data, { binary: isBinary });
+    });
+
+    upstream.on("close", () => {
+        if (downstream.readyState === WebSocket.OPEN) {
+            downstream.close();
+        }
+    });
+
+    upstream.on("error", () => {
+        if (downstream.readyState === WebSocket.OPEN) {
+            downstream.close(1011, "Display upstream error");
+        }
     });
 });
 
