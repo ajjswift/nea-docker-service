@@ -160,12 +160,16 @@ function normalizeFiles(files) {
         );
         if (!safeName) continue;
 
+        const rawData = normalizeRawData(file?.rawData);
+
         normalized.push({
             name: safeName,
             content:
-                typeof file?.content === "string"
+                !rawData && typeof file?.content === "string"
                     ? file.content
                     : `${file?.content ?? ""}`,
+            rawData,
+            isBinary: Boolean(rawData),
         });
     }
 
@@ -174,6 +178,66 @@ function normalizeFiles(files) {
     }
 
     return normalized;
+}
+
+function normalizeRawData(value) {
+    if (
+        value &&
+        typeof value === "object" &&
+        value.encoding === "base64" &&
+        typeof value.value === "string"
+    ) {
+        return {
+            encoding: "base64",
+            value: value.value,
+        };
+    }
+
+    return null;
+}
+
+function isBinaryBuffer(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        return false;
+    }
+
+    if (buffer.includes(0)) {
+        return true;
+    }
+
+    const decoded = buffer.toString("utf-8");
+    return !Buffer.from(decoded, "utf-8").equals(buffer);
+}
+
+function toWorkspaceFilePayload(name, buffer) {
+    if (isBinaryBuffer(buffer)) {
+        return {
+            name,
+            content: "",
+            rawData: {
+                encoding: "base64",
+                value: buffer.toString("base64"),
+            },
+            isBinary: true,
+        };
+    }
+
+    return {
+        name,
+        content: buffer.toString("utf-8"),
+    };
+}
+
+function getFileBuffer(file) {
+    const rawData = normalizeRawData(file?.rawData);
+    if (rawData) {
+        return Buffer.from(rawData.value, "base64");
+    }
+
+    return Buffer.from(
+        typeof file?.content === "string" ? file.content : `${file?.content ?? ""}`,
+        "utf-8"
+    );
 }
 
 async function readWorkspaceFiles(workspaceDir) {
@@ -190,11 +254,8 @@ async function readWorkspaceFiles(workspaceDir) {
         }
 
         const filePath = join(workspaceDir, entry.name);
-        const content = await readFile(filePath, "utf-8");
-        files.push({
-            name: basename(entry.name),
-            content,
-        });
+        const content = await readFile(filePath);
+        files.push(toWorkspaceFilePayload(basename(entry.name), content));
     }
 
     return files;
@@ -704,7 +765,7 @@ class ExecutionSession {
     async start() {
         this.tempDir = await mkdtemp(join(tmpdir(), "runner-"));
         for (const file of this.files) {
-            await writeFile(join(this.tempDir, file.name), file.content, "utf-8");
+            await writeFile(join(this.tempDir, file.name), getFileBuffer(file));
         }
 
         this.displayScriptPath = join(this.tempDir, RUNNER_LAUNCH_SCRIPT_NAME);
