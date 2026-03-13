@@ -43,10 +43,58 @@ const RUNNER_DISPLAY_SCREEN =
 const RUNNER_DISPLAY_START_TIMEOUT_MS = Number(
     process.env.RUNNER_DISPLAY_START_TIMEOUT_MS || 15000
 );
+const DISPLAY_DEBUG = ["1", "true", "yes", "on"].includes(
+    `${process.env.DISPLAY_DEBUG || "1"}`.trim().toLowerCase()
+);
 const RUNNER_LAUNCH_SCRIPT_PATH = new URL(
     "./runtime/start-program.sh",
     import.meta.url
 );
+
+function maskToken(value) {
+    const token = `${value || ""}`.trim();
+    if (!token) {
+        return null;
+    }
+    if (token.length <= 8) {
+        return token;
+    }
+    return `${token.slice(0, 4)}...${token.slice(-4)}`;
+}
+
+function summarizeSession(session) {
+    if (!session) {
+        return {
+            hasSession: false,
+        };
+    }
+
+    return {
+        hasSession: true,
+        sessionId: session.id || null,
+        containerName: session.containerName || null,
+        enableDisplay: Boolean(session.enableDisplay),
+        displayHostPort: session.displayHostPort ?? null,
+        displayToken: maskToken(session.displayToken),
+        processExited:
+            session.process?.exitCode !== undefined &&
+            session.process?.exitCode !== null,
+        stopping: Boolean(session.stopping),
+        ended: Boolean(session.ended),
+    };
+}
+
+function logDisplayDebug(event, details = {}) {
+    if (!DISPLAY_DEBUG) {
+        return;
+    }
+
+    console.log(`[display-runner] ${event}`, {
+        pid: process.pid,
+        at: new Date().toISOString(),
+        ...details,
+    });
+}
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -333,15 +381,33 @@ async function resolvePublishedPort(containerName, containerPort) {
 async function waitForDisplayReady(hostPort) {
     const startedAt = Date.now();
     const url = `http://${RUNNER_DISPLAY_PROXY_HOST}:${hostPort}/vnc.html`;
+    logDisplayDebug("wait-for-display-ready-start", {
+        hostPort,
+        url,
+        proxyHost: RUNNER_DISPLAY_PROXY_HOST,
+    });
 
     while (Date.now() - startedAt < RUNNER_DISPLAY_START_TIMEOUT_MS) {
         try {
             const response = await fetch(url);
             if (response.ok) {
+                logDisplayDebug("wait-for-display-ready-ok", {
+                    hostPort,
+                    url,
+                    status: response.status,
+                });
                 return;
             }
+            logDisplayDebug("wait-for-display-ready-not-ready", {
+                hostPort,
+                url,
+                status: response.status,
+            });
         } catch {
-            // Retry until timeout.
+            logDisplayDebug("wait-for-display-ready-retry", {
+                hostPort,
+                url,
+            });
         }
 
         await sleep(200);
@@ -659,6 +725,16 @@ class ExecutionSession {
             "/workspace/__runner_start__.sh"
         );
 
+        logDisplayDebug("session-start", {
+            ...summarizeSession(this),
+            entryFile: this.entryFile,
+            fileCount: this.files.length,
+            tempDir: this.tempDir,
+            displayBindHost: RUNNER_DISPLAY_BIND_HOST,
+            displayProxyHost: RUNNER_DISPLAY_PROXY_HOST,
+            dockerArgs,
+        });
+
         this.process = spawn("docker", dockerArgs, {
             stdio: ["pipe", "pipe", "pipe"],
         });
@@ -680,6 +756,10 @@ class ExecutionSession {
         });
 
         this.process.on("error", (error) => {
+            logDisplayDebug("session-process-error", {
+                ...summarizeSession(this),
+                error: error?.message || "Docker process error.",
+            });
             this.emit({
                 type: "programError",
                 data: error?.message || "Docker process error.",
@@ -687,6 +767,10 @@ class ExecutionSession {
         });
 
         this.process.on("close", async (exitCode) => {
+            logDisplayDebug("session-process-close", {
+                ...summarizeSession(this),
+                exitCode,
+            });
             if (this.enableDisplay) {
                 this.emit({
                     type: "displayState",
@@ -711,7 +795,13 @@ class ExecutionSession {
 
             try {
                 this.displayHostPort = await this.waitForDisplayPort();
+                logDisplayDebug("display-port-resolved", {
+                    ...summarizeSession(this),
+                });
                 await waitForDisplayReady(this.displayHostPort);
+                logDisplayDebug("display-ready", {
+                    ...summarizeSession(this),
+                });
                 this.emit({
                     type: "displayState",
                     data: {
@@ -720,6 +810,12 @@ class ExecutionSession {
                     },
                 });
             } catch (error) {
+                logDisplayDebug("display-start-failed", {
+                    ...summarizeSession(this),
+                    error:
+                        error?.message ||
+                        "The graphical display did not become ready.",
+                });
                 this.emit({
                     type: "displayState",
                     data: {
@@ -738,18 +834,35 @@ class ExecutionSession {
 
     async waitForDisplayPort() {
         const startedAt = Date.now();
+        logDisplayDebug("wait-for-display-port-start", {
+            ...summarizeSession(this),
+            expectedContainerPort: RUNNER_DISPLAY_NOVNC_PORT,
+        });
 
         while (Date.now() - startedAt < RUNNER_DISPLAY_START_TIMEOUT_MS) {
             if (!this.process || this.process.exitCode !== null) {
+                logDisplayDebug("wait-for-display-port-process-exited", {
+                    ...summarizeSession(this),
+                    exitCode: this.process?.exitCode ?? null,
+                });
                 throw new Error("The graphical container exited before the display was ready.");
             }
 
             try {
-                return await resolvePublishedPort(
+                const port = await resolvePublishedPort(
                     this.containerName,
                     RUNNER_DISPLAY_NOVNC_PORT
                 );
+                logDisplayDebug("wait-for-display-port-ok", {
+                    ...summarizeSession(this),
+                    resolvedPort: port,
+                });
+                return port;
             } catch {
+                logDisplayDebug("wait-for-display-port-retry", {
+                    ...summarizeSession(this),
+                    expectedContainerPort: RUNNER_DISPLAY_NOVNC_PORT,
+                });
                 await sleep(200);
             }
         }
@@ -821,6 +934,9 @@ class ExecutionSession {
     async stop() {
         if (this.stopping) return;
         this.stopping = true;
+        logDisplayDebug("session-stop", {
+            ...summarizeSession(this),
+        });
 
         try {
             if (this.containerName) {
@@ -843,6 +959,10 @@ class ExecutionSession {
         if (this.cleaned) return;
         this.cleaned = true;
         this.ended = true;
+        logDisplayDebug("session-cleanup", {
+            ...summarizeSession(this),
+            tempDir: this.tempDir,
+        });
 
         if (this.timeoutId) {
             clearTimeout(this.timeoutId);
@@ -874,7 +994,13 @@ class SessionStore {
     }
 
     get(id) {
-        return this.sessions.get(id) || null;
+        const session = this.sessions.get(id) || null;
+        logDisplayDebug("session-get", {
+            sessionId: id,
+            ...summarizeSession(session),
+            sessionCount: this.sessions.size,
+        });
+        return session;
     }
 
     async create(files, entryFile, enableDisplay) {
@@ -883,10 +1009,25 @@ class SessionStore {
         });
 
         this.sessions.set(session.id, session);
+        logDisplayDebug("session-create", {
+            ...summarizeSession(session),
+            entryFile,
+            enableDisplay,
+            sessionCount: this.sessions.size,
+        });
         try {
             await session.start();
+            logDisplayDebug("session-create-ready", {
+                ...summarizeSession(session),
+                sessionCount: this.sessions.size,
+            });
             return session;
         } catch (error) {
+            logDisplayDebug("session-create-failed", {
+                ...summarizeSession(session),
+                error: error?.message || "Session start failed.",
+                sessionCount: this.sessions.size,
+            });
             this.deleteNow(session.id);
             await session.stop().catch(() => {});
             await session.cleanup();
@@ -897,6 +1038,11 @@ class SessionStore {
     markForCleanup(id) {
         if (!this.sessions.has(id)) return;
         if (this.cleanupTimers.has(id)) return;
+        logDisplayDebug("session-mark-for-cleanup", {
+            sessionId: id,
+            retentionMs: RUNNER_SESSION_RETENTION_MS,
+            sessionCount: this.sessions.size,
+        });
 
         if (!Number.isFinite(RUNNER_SESSION_RETENTION_MS) || RUNNER_SESSION_RETENTION_MS <= 0) {
             this.deleteNow(id);
@@ -916,6 +1062,11 @@ class SessionStore {
             clearTimeout(existingTimer);
             this.cleanupTimers.delete(id);
         }
+        logDisplayDebug("session-delete", {
+            sessionId: id,
+            hadSession: this.sessions.has(id),
+            sessionCountBeforeDelete: this.sessions.size,
+        });
         this.sessions.delete(id);
     }
 }
@@ -998,13 +1149,31 @@ const httpServer = createServer(async (req, res) => {
         const displayAssetRoute = parseDisplayAssetRoute(url.pathname);
         if (displayAssetRoute && req.method === "GET") {
             const session = sessions.get(displayAssetRoute.sessionId);
+            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
+            logDisplayDebug("asset-request", {
+                sessionId: displayAssetRoute.sessionId,
+                assetPath: displayAssetRoute.assetPath,
+                displayToken: maskToken(displayToken),
+                ...summarizeSession(session),
+            });
             if (!session || !session.hasDisplay()) {
+                logDisplayDebug("asset-request-miss", {
+                    sessionId: displayAssetRoute.sessionId,
+                    assetPath: displayAssetRoute.assetPath,
+                    displayToken: maskToken(displayToken),
+                    ...summarizeSession(session),
+                });
                 sendJson(res, 404, { error: "Display session not found." });
                 return;
             }
 
-            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
             if (!session.validateDisplayToken(displayToken)) {
+                logDisplayDebug("asset-request-unauthorized", {
+                    sessionId: displayAssetRoute.sessionId,
+                    assetPath: displayAssetRoute.assetPath,
+                    displayToken: maskToken(displayToken),
+                    ...summarizeSession(session),
+                });
                 sendJson(res, 401, { error: "Unauthorized." });
                 return;
             }
@@ -1014,11 +1183,34 @@ const httpServer = createServer(async (req, res) => {
                     url.searchParams,
                     ["displayToken"]
                 )}`;
+                const upstreamUrl = `http://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}${upstreamPath}`;
+                logDisplayDebug("asset-upstream-fetch", {
+                    sessionId: displayAssetRoute.sessionId,
+                    assetPath: displayAssetRoute.assetPath,
+                    upstreamUrl,
+                    ...summarizeSession(session),
+                });
                 const upstream = await fetch(
-                    `http://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}${upstreamPath}`
+                    upstreamUrl
                 );
+                logDisplayDebug("asset-upstream-response", {
+                    sessionId: displayAssetRoute.sessionId,
+                    assetPath: displayAssetRoute.assetPath,
+                    upstreamUrl,
+                    upstreamStatus: upstream.status,
+                    ...summarizeSession(session),
+                });
                 await proxyHttpResponse(res, upstream);
             } catch (error) {
+                logDisplayDebug("asset-upstream-error", {
+                    sessionId: displayAssetRoute.sessionId,
+                    assetPath: displayAssetRoute.assetPath,
+                    displayToken: maskToken(displayToken),
+                    error:
+                        error?.message ||
+                        "Could not proxy the noVNC asset request.",
+                    ...summarizeSession(session),
+                });
                 sendJson(res, 502, {
                     error:
                         error?.message ||
@@ -1115,20 +1307,40 @@ httpServer.on("upgrade", (req, socket, head) => {
 
         if (displayRoute) {
             const session = sessions.get(displayRoute.sessionId);
+            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
+            logDisplayDebug("display-socket-upgrade-request", {
+                sessionId: displayRoute.sessionId,
+                displayToken: maskToken(displayToken),
+                ...summarizeSession(session),
+            });
             if (!session || !session.hasDisplay()) {
+                logDisplayDebug("display-socket-upgrade-miss", {
+                    sessionId: displayRoute.sessionId,
+                    displayToken: maskToken(displayToken),
+                    ...summarizeSession(session),
+                });
                 socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
                 socket.destroy();
                 return;
             }
 
-            const displayToken = `${url.searchParams.get("displayToken") || ""}`;
             if (!session.validateDisplayToken(displayToken)) {
+                logDisplayDebug("display-socket-upgrade-unauthorized", {
+                    sessionId: displayRoute.sessionId,
+                    displayToken: maskToken(displayToken),
+                    ...summarizeSession(session),
+                });
                 socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
                 socket.destroy();
                 return;
             }
 
             displayWsServer.handleUpgrade(req, socket, head, (ws) => {
+                logDisplayDebug("display-socket-upgrade-ok", {
+                    sessionId: displayRoute.sessionId,
+                    displayToken: maskToken(displayToken),
+                    ...summarizeSession(session),
+                });
                 displayWsServer.emit("connection", ws, displayRoute.sessionId);
             });
             return;
@@ -1181,12 +1393,22 @@ wsServer.on("connection", (ws, sessionId) => {
 displayWsServer.on("connection", (downstream, sessionId) => {
     const session = sessions.get(sessionId);
     if (!session || !session.hasDisplay()) {
+        logDisplayDebug("display-proxy-open-miss", {
+            sessionId,
+            ...summarizeSession(session),
+        });
         downstream.close();
         return;
     }
 
+    const upstreamUrl = `ws://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}/websockify`;
+    logDisplayDebug("display-proxy-open", {
+        sessionId,
+        upstreamUrl,
+        ...summarizeSession(session),
+    });
     const upstream = new WebSocket(
-        `ws://${RUNNER_DISPLAY_PROXY_HOST}:${session.displayHostPort}/websockify`
+        upstreamUrl
     );
     upstream.binaryType = "arraybuffer";
 
@@ -1210,10 +1432,18 @@ displayWsServer.on("connection", (downstream, sessionId) => {
     });
 
     downstream.on("close", () => {
+        logDisplayDebug("display-proxy-downstream-close", {
+            sessionId,
+            ...summarizeSession(session),
+        });
         closeBoth();
     });
 
     downstream.on("error", () => {
+        logDisplayDebug("display-proxy-downstream-error", {
+            sessionId,
+            ...summarizeSession(session),
+        });
         closeBoth();
     });
 
@@ -1224,13 +1454,35 @@ displayWsServer.on("connection", (downstream, sessionId) => {
         downstream.send(data, { binary: isBinary });
     });
 
-    upstream.on("close", () => {
+    upstream.on("open", () => {
+        logDisplayDebug("display-proxy-upstream-open", {
+            sessionId,
+            upstreamUrl,
+            ...summarizeSession(session),
+        });
+    });
+
+    upstream.on("close", (event) => {
+        logDisplayDebug("display-proxy-upstream-close", {
+            sessionId,
+            upstreamUrl,
+            code: event?.code ?? null,
+            reason: typeof event?.reason === "string" ? event.reason : null,
+            wasClean: event?.wasClean ?? null,
+            ...summarizeSession(session),
+        });
         if (downstream.readyState === WebSocket.OPEN) {
             downstream.close();
         }
     });
 
-    upstream.on("error", () => {
+    upstream.on("error", (error) => {
+        logDisplayDebug("display-proxy-upstream-error", {
+            sessionId,
+            upstreamUrl,
+            error: error?.message || "Unknown upstream websocket error",
+            ...summarizeSession(session),
+        });
         if (downstream.readyState === WebSocket.OPEN) {
             downstream.close(1011, "Display upstream error");
         }
