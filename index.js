@@ -21,6 +21,9 @@ const RUNNER_TOOL_TIMEOUT_MS = Number(
 const RUNNER_NETWORK = process.env.RUNNER_NETWORK || "none";
 const RUNNER_DISPLAY_NETWORK = process.env.RUNNER_DISPLAY_NETWORK || "bridge";
 const MAX_BUFFERED_EVENTS = Number(process.env.MAX_BUFFERED_EVENTS || 250);
+const MAX_JSON_BODY_BYTES = Number(
+    process.env.MAX_JSON_BODY_BYTES || 8 * 1024 * 1024
+);
 const MAX_TOOL_INPUT_BYTES = Number(
     process.env.MAX_TOOL_INPUT_BYTES || 250000
 );
@@ -110,28 +113,69 @@ function sendJson(res, status, payload) {
     res.end(data);
 }
 
+function createHttpError(message, statusCode = 400) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
 function readJsonBody(req) {
     return new Promise((resolve, reject) => {
-        let raw = "";
-        req.on("data", (chunk) => {
-            raw += chunk;
-            if (raw.length > 1024 * 1024) {
-                reject(new Error("Request body too large."));
-                req.destroy();
+        const chunks = [];
+        let totalBytes = 0;
+        let settled = false;
+
+        const rejectOnce = (error) => {
+            if (settled) {
+                return;
             }
+
+            settled = true;
+            reject(error);
+        };
+
+        req.on("data", (chunk) => {
+            if (settled) {
+                return;
+            }
+
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            totalBytes += buffer.length;
+
+            if (totalBytes > MAX_JSON_BODY_BYTES) {
+                rejectOnce(
+                    createHttpError(
+                        `Request body too large. Maximum size is ${MAX_JSON_BODY_BYTES} bytes.`,
+                        413
+                    )
+                );
+                return;
+            }
+
+            chunks.push(buffer);
         });
         req.on("end", () => {
-            if (!raw) {
+            if (settled) {
+                return;
+            }
+
+            if (totalBytes === 0) {
+                settled = true;
                 resolve({});
                 return;
             }
+
             try {
+                const raw = Buffer.concat(chunks).toString("utf8");
+                settled = true;
                 resolve(JSON.parse(raw));
             } catch {
-                reject(new Error("Invalid JSON body."));
+                rejectOnce(createHttpError("Invalid JSON body.", 400));
             }
         });
-        req.on("error", reject);
+        req.on("error", (error) => {
+            rejectOnce(error);
+        });
     });
 }
 
@@ -604,7 +648,9 @@ async function handlePythonFormatRequest(req, res) {
     try {
         body = await readJsonBody(req);
     } catch (error) {
-        sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+        sendJson(res, error?.statusCode || 400, {
+            error: error.message || "Invalid JSON body.",
+        });
         return;
     }
 
@@ -675,7 +721,9 @@ async function handlePythonLintRequest(req, res) {
     try {
         body = await readJsonBody(req);
     } catch (error) {
-        sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+        sendJson(res, error?.statusCode || 400, {
+            error: error.message || "Invalid JSON body.",
+        });
         return;
     }
 
@@ -1236,7 +1284,9 @@ const httpServer = createServer(async (req, res) => {
             try {
                 body = await readJsonBody(req);
             } catch (error) {
-                sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+                sendJson(res, error?.statusCode || 400, {
+                    error: error.message || "Invalid JSON body.",
+                });
                 return;
             }
 
@@ -1372,7 +1422,9 @@ const httpServer = createServer(async (req, res) => {
             try {
                 body = await readJsonBody(req);
             } catch (error) {
-                sendJson(res, 400, { error: error.message || "Invalid JSON body." });
+                sendJson(res, error?.statusCode || 400, {
+                    error: error.message || "Invalid JSON body.",
+                });
                 return;
             }
 

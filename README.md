@@ -31,6 +31,7 @@ Stream events mirror the websocket app contract:
 - `RUNNER_TOOL_TIMEOUT_MS` default `20000` (timeout for formatter/linter calls)
 - `RUNNER_NETWORK` default `none`
 - `MAX_BUFFERED_EVENTS` default `250`
+- `MAX_JSON_BODY_BYTES` default `8388608` (8 MiB for JSON requests such as session creation)
 - `MAX_TOOL_INPUT_BYTES` default `250000`
 - `RUNNER_SESSION_RETENTION_MS` default `30000` (keeps completed sessions briefly so late stream connections can still receive exit/output events)
 
